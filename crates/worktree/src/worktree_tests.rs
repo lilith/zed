@@ -2924,3 +2924,65 @@ async fn test_refresh_entries_for_paths_creates_ancestors(cx: &mut TestAppContex
         );
     });
 }
+
+#[gpui::test]
+async fn test_poll_watcher_detection(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+
+    // Set up a filesystem that reports it requires poll watching
+    fs.set_requires_poll_watcher(true);
+
+    fs.insert_tree(
+        "/network_mount",
+        json!({
+            "file.txt": "content"
+        }),
+    )
+    .await;
+
+    // Verify the FakeFs correctly reports poll watcher requirement
+    assert!(
+        fs.requires_poll_watcher(Path::new("/network_mount")).await,
+        "FakeFs should report poll watcher is required when set"
+    );
+
+    // Create a worktree on this "network" filesystem
+    let tree = Worktree::local(
+        Path::new("/network_mount"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    // Verify the worktree was created and scanned successfully
+    tree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.entries(true, 0)
+                .map(|entry| entry.path.as_ref())
+                .collect::<Vec<_>>(),
+            vec![rel_path(""), rel_path("file.txt"),]
+        );
+    });
+
+    // Test file change detection works (via FakeFs event system)
+    fs.insert_file("/network_mount/new_file.txt", "new content".into())
+        .await;
+
+    tree.flush_fs_events(cx).await;
+
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.entries(true, 0)
+                .any(|e| e.path.as_ref() == rel_path("new_file.txt")),
+            "New file should be detected"
+        );
+    });
+}
