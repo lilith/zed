@@ -1,0 +1,42 @@
+name: Build Windows (Fork)
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'feature/**'
+
+jobs:
+  build_windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install Visual Studio Build Tools components
+        shell: pwsh
+        run: |
+          # Install Spectre-mitigated libs via VS Installer
+          $installerPath = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          if (Test-Path $installerPath) {
+            & $installerPath modify --installPath "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Enterprise" --add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --quiet --norestart
+          }
+
+      - name: Setup cargo config
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path ".\..\..cargo" -Force
+          Copy-Item -Path ".\.cargo\ci-config.toml" -Destination ".\..\..cargo\config.toml" -ErrorAction SilentlyContinue
+
+      - name: Build Release
+        shell: pwsh
+        run: cargo build --release -p zed
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-windows-x86_64
+          path: target/release/zed.exe
+          if-no-files-found: error
