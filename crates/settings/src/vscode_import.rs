@@ -927,6 +927,7 @@ impl VsCodeSettings {
                         .collect::<Vec<_>>()
                 })
                 .filter(|r| !r.is_empty()),
+            file_watcher: None,
         }
     }
 }

@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use anyhow::Context as _;
 use settings::{RegisterSetting, Settings};
+use settings_content::FileWatcherMode;
 use util::{
     ResultExt,
     paths::{PathMatcher, PathStyle},
@@ -21,6 +22,23 @@ pub struct WorktreeSettings {
     pub private_files: PathMatcher,
     pub hidden_files: PathMatcher,
     pub read_only_files: PathMatcher,
+    pub file_watcher: FileWatcherSettings,
+}
+
+/// Parsed file watcher settings.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FileWatcherSettings {
+    pub mode: FileWatcherMode,
+    pub poll_interval: Duration,
+}
+
+impl Default for FileWatcherSettings {
+    fn default() -> Self {
+        Self {
+            mode: FileWatcherMode::Auto,
+            poll_interval: Duration::from_millis(2000),
+        }
+    }
 }
 
 impl WorktreeSettings {
@@ -75,6 +93,17 @@ impl Settings for WorktreeSettings {
             .filter(|p: &String| !p.is_empty())
             .collect();
 
+        let file_watcher = worktree.file_watcher.map_or_else(
+            FileWatcherSettings::default,
+            |fw| {
+                let poll_interval_ms = fw.poll_interval_ms.unwrap_or(2000).clamp(500, 30000);
+                FileWatcherSettings {
+                    mode: fw.mode.unwrap_or_default(),
+                    poll_interval: Duration::from_millis(poll_interval_ms as u64),
+                }
+            },
+        );
+
         Self {
             project_name: worktree.project_name,
             prevent_sharing_in_public_channels: worktree.prevent_sharing_in_public_channels,
@@ -97,6 +126,7 @@ impl Settings for WorktreeSettings {
             read_only_files: path_matchers(read_only_files, "read_only_files")
                 .log_err()
                 .unwrap_or_default(),
+            file_watcher,
         }
     }
 }
@@ -126,6 +156,7 @@ mod tests {
                 PathStyle::local(),
             )
             .unwrap(),
+            file_watcher: FileWatcherSettings::default(),
         }
     }
 

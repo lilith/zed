@@ -132,6 +132,55 @@ pub struct WorktreeSettingsContent {
     /// external dependencies that should not be modified directly.
     /// Default: []
     pub read_only_files: Option<Vec<String>>,
+
+    /// Configuration for file watching.
+    ///
+    /// Zed uses file watchers to detect changes made to files outside the editor.
+    /// On some filesystems (NFS, SSHFS, WSL paths from Windows), native file watching
+    /// doesn't work reliably. This setting allows you to configure polling-based
+    /// file watching as an alternative.
+    pub file_watcher: Option<FileWatcherSettingsContent>,
+}
+
+/// Configuration for file watching behavior.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct FileWatcherSettingsContent {
+    /// How to detect file changes.
+    ///
+    /// - "auto": Automatically detect if polling is needed based on filesystem type (default)
+    /// - "native": Always use OS-native file watching (inotify/FSEvents/ReadDirectoryChanges)
+    /// - "poll": Always use polling-based file watching
+    ///
+    /// Use "poll" if you're working on a network filesystem, SSHFS mount, or accessing
+    /// WSL paths from Windows and file changes aren't being detected.
+    ///
+    /// Default: "auto"
+    pub mode: Option<FileWatcherMode>,
+
+    /// Polling interval in milliseconds when using poll mode.
+    ///
+    /// Lower values detect changes faster but use more CPU.
+    /// Higher values are more efficient but have more latency.
+    ///
+    /// Range: 500-30000 (0.5 to 30 seconds)
+    /// Default: 2000 (2 seconds)
+    pub poll_interval_ms: Option<u32>,
+}
+
+/// File watcher mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub enum FileWatcherMode {
+    /// Automatically detect if polling is needed based on filesystem type.
+    /// Uses native watching on local filesystems and polling on network/virtual filesystems.
+    #[default]
+    Auto,
+    /// Always use OS-native file watching (inotify on Linux, FSEvents on macOS,
+    /// ReadDirectoryChanges on Windows). Most efficient but doesn't work on all filesystems.
+    Native,
+    /// Always use polling-based file watching. Works on all filesystems but uses more CPU.
+    Poll,
 }
 
 #[with_fallible_options]

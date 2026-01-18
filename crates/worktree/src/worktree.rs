@@ -1082,9 +1082,43 @@ impl LocalWorktree {
         let background_scanner = cx.background_spawn({
             let abs_path = snapshot.abs_path.as_path().to_path_buf();
             let background = cx.background_executor().clone();
+            let file_watcher_settings = settings.file_watcher.clone();
             async move {
                 let (events, watcher) = if scanning_enabled {
-                    fs.watch(&abs_path, FS_WATCH_LATENCY).await
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        use fs::fs_watcher::WatcherMode;
+                        use settings_content::FileWatcherMode;
+
+                        let watcher_mode = match file_watcher_settings.mode {
+                            FileWatcherMode::Native => WatcherMode::Native,
+                            FileWatcherMode::Poll => WatcherMode::Poll,
+                            FileWatcherMode::Auto => {
+                                if fs.requires_poll_watcher(&abs_path).await {
+                                    log::info!(
+                                        "Auto-detected filesystem requiring poll watcher at {}",
+                                        abs_path.display()
+                                    );
+                                    WatcherMode::Poll
+                                } else {
+                                    WatcherMode::Native
+                                }
+                            }
+                        };
+
+                        fs.watch_with_mode(
+                            &abs_path,
+                            FS_WATCH_LATENCY,
+                            watcher_mode,
+                            file_watcher_settings.poll_interval,
+                        )
+                        .await
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        let _ = file_watcher_settings; // macOS always uses native FSEvents
+                        fs.watch(&abs_path, FS_WATCH_LATENCY).await
+                    }
                 } else {
                     (Box::pin(stream::pending()) as _, Arc::new(NullWatcher) as _)
                 };

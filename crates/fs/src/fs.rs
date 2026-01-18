@@ -140,6 +140,22 @@ pub trait Fs: Send + Sync {
         Arc<dyn Watcher>,
     );
 
+    #[cfg(not(target_os = "macos"))]
+    async fn watch_with_mode(
+        &self,
+        path: &Path,
+        latency: Duration,
+        mode: fs_watcher::WatcherMode,
+        poll_interval: Duration,
+    ) -> (
+        Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>,
+        Arc<dyn Watcher>,
+    );
+
+    /// Checks if the given path is on a filesystem that requires polling
+    /// (e.g., network filesystems, WSL paths from Windows, FUSE mounts).
+    async fn requires_poll_watcher(&self, path: &Path) -> bool;
+
     fn open_repo(
         &self,
         abs_dot_git: &Path,
@@ -307,6 +323,131 @@ impl From<MTime> for proto::Timestamp {
     fn from(mtime: MTime) -> Self {
         mtime.0.into()
     }
+}
+
+/// Detects if a path is on a filesystem that requires polling for file watching.
+/// This includes network filesystems (NFS, CIFS/SMB), FUSE mounts, and WSL paths from Windows.
+#[cfg(not(target_os = "macos"))]
+async fn detect_requires_poll_watcher(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // Check if we're running inside WSL and the path is on a Windows mount (drvfs)
+        if is_wsl_environment() {
+            if let Some(path_str) = path.to_str() {
+                // Windows drives are mounted at /mnt/c, /mnt/d, etc. in WSL
+                if path_str.starts_with("/mnt/") && path_str.len() > 5 {
+                    let after_mnt = &path_str[5..];
+                    if after_mnt.starts_with(|c: char| c.is_ascii_alphabetic())
+                        && (after_mnt.len() == 1 || after_mnt.chars().nth(1) == Some('/'))
+                    {
+                        log::debug!(
+                            "Detected Windows drive mount in WSL at {}, polling recommended",
+                            path.display()
+                        );
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Use statfs to detect filesystem type
+        if let Ok(stat) = nix::sys::statfs::statfs(path) {
+            let fs_type = stat.filesystem_type();
+            // These filesystem types don't support inotify properly
+            const NFS_SUPER_MAGIC: i64 = 0x6969;
+            const CIFS_MAGIC_NUMBER: i64 = 0xFF534D42;
+            const SMB_SUPER_MAGIC: i64 = 0x517B;
+            const SMB2_MAGIC_NUMBER: i64 = 0xFE534D42;
+            const FUSE_SUPER_MAGIC: i64 = 0x65735546; // Includes SSHFS
+            const V9FS_MAGIC: i64 = 0x01021997; // Plan 9 / WSL interop
+            const DRVFS_MAGIC: i64 = 0x6472766673; // WSL drvfs (Windows drives)
+
+            let type_val = fs_type.0;
+            if type_val == NFS_SUPER_MAGIC
+                || type_val == CIFS_MAGIC_NUMBER
+                || type_val == SMB_SUPER_MAGIC
+                || type_val == SMB2_MAGIC_NUMBER
+                || type_val == FUSE_SUPER_MAGIC
+                || type_val == V9FS_MAGIC
+                || type_val == DRVFS_MAGIC
+            {
+                log::debug!(
+                    "Detected network/virtual filesystem (type 0x{:x}) at {}, polling recommended",
+                    type_val,
+                    path.display()
+                );
+                return true;
+            }
+        }
+
+        false
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let path_str = path.to_string_lossy();
+
+        // Detect WSL paths accessed from Windows
+        // These include \\wsl$\, \\wsl.localhost\, and \\wsl\
+        if path_str.starts_with(r"\\wsl$\")
+            || path_str.starts_with(r"\\wsl.localhost\")
+            || path_str.starts_with(r"\\wsl\")
+        {
+            log::debug!(
+                "Detected WSL path from Windows at {}, polling recommended",
+                path.display()
+            );
+            return true;
+        }
+
+        // Detect general UNC network paths (\\server\share)
+        // But exclude local paths like \\?\C:\
+        if path_str.starts_with(r"\\") && !path_str.starts_with(r"\\?\") {
+            log::debug!(
+                "Detected network path at {}, polling recommended",
+                path.display()
+            );
+            return true;
+        }
+
+        false
+    }
+
+    #[cfg(target_os = "freebsd")]
+    {
+        // FreeBSD uses kqueue which has similar limitations on network filesystems
+        if let Ok(stat) = nix::sys::statfs::statfs(path) {
+            let fs_type_name = stat.filesystem_type_name();
+            if fs_type_name == "nfs" || fs_type_name == "smbfs" || fs_type_name == "fusefs" {
+                log::debug!(
+                    "Detected network/virtual filesystem ({}) at {}, polling recommended",
+                    fs_type_name,
+                    path.display()
+                );
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Checks if we're running inside WSL (Windows Subsystem for Linux)
+#[cfg(target_os = "linux")]
+fn is_wsl_environment() -> bool {
+    // Check for WSL-specific environment variable
+    if std::env::var("WSL_DISTRO_NAME").is_ok() {
+        return true;
+    }
+
+    // Check /proc/version for Microsoft/WSL indicators
+    if let Ok(version) = std::fs::read_to_string("/proc/version") {
+        let version_lower = version.to_lowercase();
+        if version_lower.contains("microsoft") || version_lower.contains("wsl") {
+            return true;
+        }
+    }
+
+    false
 }
 
 pub struct RealFs {
@@ -1031,6 +1172,12 @@ impl Fs for RealFs {
         )
     }
 
+    #[cfg(target_os = "macos")]
+    async fn requires_poll_watcher(&self, _path: &Path) -> bool {
+        // macOS FSEvents works well on all filesystems including network mounts
+        false
+    }
+
     #[cfg(not(target_os = "macos"))]
     async fn watch(
         &self,
@@ -1094,6 +1241,95 @@ impl Fs for RealFs {
             })),
             watcher,
         )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn watch_with_mode(
+        &self,
+        path: &Path,
+        latency: Duration,
+        mode: fs_watcher::WatcherMode,
+        poll_interval: Duration,
+    ) -> (
+        Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>,
+        Arc<dyn Watcher>,
+    ) {
+        use util::{ResultExt as _, paths::SanitizedPath};
+        let executor = self.executor.clone();
+
+        let (tx, rx) = smol::channel::unbounded();
+        let pending_paths: Arc<Mutex<Vec<PathEvent>>> = Default::default();
+
+        let watcher: Arc<dyn Watcher> = match mode {
+            fs_watcher::WatcherMode::Native => {
+                Arc::new(fs_watcher::FsWatcher::new(tx, pending_paths.clone()))
+            }
+            fs_watcher::WatcherMode::Poll => {
+                match fs_watcher::PollFsWatcher::new(tx.clone(), pending_paths.clone(), poll_interval) {
+                    Ok(poll_watcher) => {
+                        log::info!(
+                            "Using PollWatcher for {} with {}ms interval",
+                            path.display(),
+                            poll_interval.as_millis()
+                        );
+                        Arc::new(poll_watcher)
+                    }
+                    Err(e) => {
+                        log::error!("Failed to create PollWatcher, falling back to native: {e}");
+                        Arc::new(fs_watcher::FsWatcher::new(tx, pending_paths.clone()))
+                    }
+                }
+            }
+        };
+
+        if let Err(e) = watcher.add(path)
+            && let Some(parent) = path.parent()
+            && let Err(parent_e) = watcher.add(parent)
+        {
+            log::warn!(
+                "Failed to watch {} and its parent directory {}:\n{e}\n{parent_e}",
+                path.display(),
+                parent.display()
+            );
+        }
+
+        if let Some(mut target) = self.read_link(path).await.ok() {
+            log::trace!("watch symlink {path:?} -> {target:?}");
+            if target.is_relative()
+                && let Some(parent) = path.parent()
+            {
+                target = parent.join(target);
+                if let Ok(canonical) = self.canonicalize(&target).await {
+                    target = SanitizedPath::new(&canonical).as_path().to_path_buf();
+                }
+            }
+            watcher.add(&target).ok();
+            if let Some(parent) = target.parent() {
+                watcher.add(parent).log_err();
+            }
+        }
+
+        (
+            Box::pin(rx.filter_map({
+                let watcher = watcher.clone();
+                let executor = executor.clone();
+                move |_| {
+                    let _ = watcher.clone();
+                    let pending_paths = pending_paths.clone();
+                    let executor = executor.clone();
+                    async move {
+                        executor.timer(latency).await;
+                        let paths = std::mem::take(&mut *pending_paths.lock());
+                        (!paths.is_empty()).then_some(paths)
+                    }
+                }
+            })),
+            watcher,
+        )
+    }
+
+    async fn requires_poll_watcher(&self, path: &Path) -> bool {
+        detect_requires_poll_watcher(path).await
     }
 
     fn open_repo(
@@ -1245,6 +1481,7 @@ struct FakeFsState {
     path_write_counts: std::collections::HashMap<PathBuf, usize>,
     moves: std::collections::HashMap<u64, PathBuf>,
     job_event_subscribers: Arc<Mutex<Vec<JobEventSender>>>,
+    requires_poll_watcher: bool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1530,6 +1767,7 @@ impl FakeFs {
                 path_write_counts: Default::default(),
                 moves: Default::default(),
                 job_event_subscribers: Arc::new(Mutex::new(Vec::new())),
+                requires_poll_watcher: false,
             })),
         });
 
@@ -1695,6 +1933,12 @@ impl FakeFs {
 
     pub fn flush_events(&self, count: usize) {
         self.state.lock().flush_events(count);
+    }
+
+    /// Set whether this FakeFs should report that paths require poll watching.
+    /// Useful for testing poll watcher selection logic.
+    pub fn set_requires_poll_watcher(&self, requires: bool) {
+        self.state.lock().requires_poll_watcher = requires;
     }
 
     pub(crate) fn entry(&self, target: &Path) -> Result<FakeFsEntry> {
@@ -2758,6 +3002,27 @@ impl Fs for FakeFs {
             })),
             watcher,
         )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn watch_with_mode(
+        &self,
+        path: &Path,
+        latency: Duration,
+        _mode: fs_watcher::WatcherMode,
+        _poll_interval: Duration,
+    ) -> (
+        Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>,
+        Arc<dyn Watcher>,
+    ) {
+        // FakeFs always uses the same fake watching mechanism regardless of mode
+        self.watch(path, latency).await
+    }
+
+    async fn requires_poll_watcher(&self, _path: &Path) -> bool {
+        // FakeFs never requires poll watcher
+        // Tests can override this with set_requires_poll_watcher if needed
+        self.state.lock().requires_poll_watcher
     }
 
     fn open_repo(
